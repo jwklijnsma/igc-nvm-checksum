@@ -37,7 +37,7 @@
 set -euo pipefail
 
 PKG="igc-nvmfix"
-PKGVER="2.2"
+PKGVER="2.3"
 SRCDIR="/usr/src/${PKG}-${PKGVER}"
 KVER="$(uname -r)"
 
@@ -50,6 +50,25 @@ die()  { echo -e "\e[1;31m[x]\e[0m $*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 # --status / --uninstall
 # ---------------------------------------------------------------------------
+NO_MAC=0
+[[ "${1:-}" == "--no-mac" ]] && { NO_MAC=1; shift; }
+
+# systemctl/reboot fail with "Transport endpoint is not connected" when PID 1
+# lost its control socket (typically after a systemd upgrade inside an apt run
+# that was interrupted). Re-exec systemd to restore it.
+ensure_systemd() {
+    [[ -d /run/systemd/system ]] || return 0
+    systemctl show -p Version >/dev/null 2>&1 && return 0
+    warn "systemd (PID 1) is not reachable ('Transport endpoint is not connected')."
+    warn "Re-executing systemd (same as 'systemctl daemon-reexec')..."
+    kill -TERM 1 || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 1
+        systemctl show -p Version >/dev/null 2>&1 && { log "systemd reachable again."; return 0; }
+    done
+    warn "systemd still not reachable. For a clean reboot use: kill -INT 1"
+}
+
 case "${1:-}" in
     --status)
         dkms status "$PKG" 2>/dev/null || echo "dkms not installed"
@@ -70,6 +89,11 @@ case "${1:-}" in
         done
         rm -rf /var/cache/igc-nvmfix
         rm -f "/usr/share/dkms/modules_to_force_install/${PKG}"
+        if grep -l "^# managed by igc-nvmfix" /etc/systemd/network/*.link >/dev/null 2>&1; then
+            warn "Keeping the MAC address .link files created by igc-nvmfix:"
+            grep -l "^# managed by igc-nvmfix" /etc/systemd/network/*.link | sed 's/^/    /'
+            warn "Delete them yourself if you no longer want the fixed MAC."
+        fi
         depmod -a "$KVER"
         command -v update-initramfs >/dev/null && update-initramfs -u -k "$KVER" || true
         log "Removed. Module now resolves to: $(modinfo -n igc 2>/dev/null || echo 'none')"
@@ -80,7 +104,7 @@ case "${1:-}" in
         exit 0
         ;;
     "") ;;
-    *) die "Unknown option: $1 (use --status or --uninstall)" ;;
+    *) die "Unknown option: $1 (use --status, --uninstall or --no-mac)" ;;
 esac
 
 # ---------------------------------------------------------------------------
@@ -115,6 +139,7 @@ if command -v dkms >/dev/null 2>&1; then
 fi
 log "Finishing any interrupted package configuration (dpkg --configure -a)..."
 dpkg --configure -a || warn "dpkg --configure -a reported errors; continuing"
+ensure_systemd
 
 # ---------------------------------------------------------------------------
 # 2. Dependencies (+ headers metapackage so FUTURE kernels get headers too)
@@ -375,7 +400,60 @@ for kdir in /lib/modules/*/; do
 done
 
 # ---------------------------------------------------------------------------
-# 5. initramfs + reload
+# 5. Unique MAC for ports whose NVM has no valid MAC
+# ---------------------------------------------------------------------------
+# A corrupt NVM often yields a placeholder MAC (e.g. 00:a0:c9:00:00:00, Intel
+# OUI + zeros). Every affected card then has the SAME MAC -> ARP/switch/DHCP
+# conflicts between nodes. Pin a stable, unique, locally administered MAC via
+# a systemd .link file (derived from machine-id + PCI address, so re-runs give
+# the same value). Applied by udev on the reload below and on every boot.
+fix_placeholder_macs() {
+    local dev pci ifname mac newmac linkf hash
+    mkdir -p /etc/systemd/network
+    for dev in /sys/bus/pci/drivers/igc/0000:*; do
+        [[ -e "$dev" ]] || continue
+        pci="$(basename "$dev")"
+        linkf="/etc/systemd/network/10-igc-nvmfix-${pci//:/-}.link"
+        [[ -f "$linkf" ]] && { log "MAC for ${pci} already pinned (${linkf})."; continue; }
+        ifname="$(ls "${dev}/net" 2>/dev/null | head -1)"
+        [[ -n "$ifname" ]] || continue
+        mac="$(cat "/sys/class/net/${ifname}/address")"
+        case "$mac" in
+            00:a0:c9:00:00:00|00:00:00:00:00:00|ff:ff:ff:ff:ff:ff) ;;
+            *) continue ;;
+        esac
+        if grep -lsE "Path=pci-${pci}|Name=${ifname}$|MACAddress=${mac}" /etc/systemd/network/*.link >/dev/null; then
+            warn "${ifname} has placeholder MAC ${mac}, but an existing .link file already matches it:"
+            grep -lsE "Path=pci-${pci}|Name=${ifname}$|MACAddress=${mac}" /etc/systemd/network/*.link | sed 's/^/    /'
+            warn "Not touching it - add a unique 'MACAddress=02:..' under [Link] there yourself."
+            continue
+        fi
+        hash="$(printf '%s-%s' "$(cat /etc/machine-id 2>/dev/null || hostname)" "$pci" | md5sum)"
+        newmac="02:${hash:0:2}:${hash:2:2}:${hash:4:2}:${hash:6:2}:${hash:8:2}"
+        cat > "$linkf" <<EOF
+# managed by igc-nvmfix: the NVM of this i225/i226 has no valid MAC (${mac}).
+# Pins a unique, locally administered MAC. Delete this file to undo.
+[Match]
+Path=pci-${pci}
+
+[Link]
+Name=${ifname}
+MACAddress=${newmac}
+EOF
+        log "${ifname} (${pci}): placeholder MAC ${mac} -> ${newmac} (${linkf})"
+        MAC_CHANGED=1
+    done
+}
+
+MAC_CHANGED=0
+if [[ $NO_MAC -eq 0 ]]; then
+    fix_placeholder_macs
+else
+    log "--no-mac given: not touching MAC addresses."
+fi
+
+# ---------------------------------------------------------------------------
+# 6. initramfs + reload
 # ---------------------------------------------------------------------------
 if command -v update-initramfs >/dev/null 2>&1; then
     log "Updating initramfs..."
@@ -412,8 +490,17 @@ if command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null | grep -
     warn "and reboot to enroll the key."
 fi
 
+ensure_systemd
+
+if [[ $MAC_CHANGED -eq 1 ]]; then
+    warn "MAC address changed: a DHCP lease or static ARP/switch entries may need updating."
+fi
+
 echo
 log "Done. Module in use: ${MODPATH}"
+for n in /sys/bus/pci/drivers/igc/0000:*/net/*; do
+    [[ -e "$n" ]] && ip -br link show "$(basename "$n")"
+done
 dmesg | grep -i igc | tail -10 || true
 echo
 dkms status "$PKG"

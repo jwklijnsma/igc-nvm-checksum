@@ -24,6 +24,7 @@ sudo ./install-igc-nvmfix-dkms.sh
 | `sudo ./install-igc-nvmfix-dkms.sh` | Install or reinstall, build for the running kernel and every other installed kernel with headers |
 | `sudo ./install-igc-nvmfix-dkms.sh --status` | Show DKMS status, which `igc.ko` is in use, recent dmesg |
 | `sudo ./install-igc-nvmfix-dkms.sh --uninstall` | Remove the package and go back to the stock driver |
+| `sudo ./install-igc-nvmfix-dkms.sh --no-mac` | Install, but don't pin a MAC address (see below) |
 
 ## How it works
 
@@ -50,6 +51,20 @@ After loading you'll see this instead of the probe failure:
 ```
 igc 0000:xx:00.0: The NVM Checksum Is Not Valid (ignoring, patched driver)
 ```
+
+## Placeholder MAC address
+
+A corrupt NVM often has no valid MAC either. The driver then comes up with a placeholder such as:
+
+```
+igc 0000:02:00.0 eth0: MAC: 00:a0:c9:00:00:00
+```
+
+Every affected card gets **the same** MAC, which causes ARP, switch-table and DHCP conflicts between nodes. When the installer sees such a placeholder (`00:a0:c9:00:00:00`, all zeros or all `ff`), it writes `/etc/systemd/network/10-igc-nvmfix-<pci>.link`. That file pins a unique, locally administered MAC (`02:…`), derived from `/etc/machine-id` and the PCI address, so it stays the same across re-runs. The interface name stays the same. udev applies it at the module reload and on every boot.
+
+- An existing `.link` file that already matches the port is never overwritten. The installer warns instead.
+- Use `--no-mac` to skip this. Delete the `.link` file to undo it.
+- After the change, update any DHCP reservation or static ARP/switch entries.
 
 ## Supported systems
 
@@ -79,6 +94,23 @@ Running the current installer fixes this: it removes every older `igc-nvmfix` ve
 dkms remove igc-nvmfix/1.0 --all
 rm -rf /usr/src/igc-nvmfix-1.0
 dpkg --configure -a
+```
+
+## `reboot`: "Transport endpoint is not connected"
+
+```
+Failed to set wall message, ignoring: Transport endpoint is not connected
+Call to Reboot failed: Transport endpoint is not connected
+```
+
+systemd (PID 1) lost its control socket, usually after a systemd upgrade inside an interrupted apt run. The installer checks for this after `dpkg --configure -a` and at the end, and re-executes systemd if needed. To fix it by hand:
+
+```bash
+kill -TERM 1        # same as 'systemctl daemon-reexec'
+sleep 5
+systemctl reboot
+# still failing? clean reboot via the Ctrl+Alt+Del target:
+kill -INT 1
 ```
 
 ## Troubleshooting
