@@ -25,6 +25,40 @@ sudo ./install-igc-nvmfix-dkms.sh
 | `sudo ./install-igc-nvmfix-dkms.sh --status` | Show DKMS status, which `igc.ko` is in use, recent dmesg |
 | `sudo ./install-igc-nvmfix-dkms.sh --uninstall` | Remove the package and go back to the stock driver |
 | `sudo ./install-igc-nvmfix-dkms.sh --no-mac` | Install, but don't pin a MAC address (see below) |
+| `sudo ./install-igc-nvmfix-dkms.sh --make-bundle [DIR]` | On a machine **with** internet: download everything for an offline install into `DIR` (default `./bundle`) |
+| `sudo ./install-igc-nvmfix-dkms.sh --offline [DIR]` | Install from that bundle with **no network at all** |
+
+## Offline use
+
+When the igc port is a node's only NIC, a broken driver means no network to download anything. Prepare for that while the network still works.
+
+**1. Make a bundle** on a node with internet, running the same Debian/Proxmox release. Ideally do it on the node itself:
+
+```bash
+sudo ./install-igc-nvmfix-dkms.sh --make-bundle                 # -> ./bundle
+sudo ./install-igc-nvmfix-dkms.sh --make-bundle /mnt/usb/igc \
+     --kernels "7.0.14-30-pve 7.3.5-1-pve" --with-kernel-images
+```
+
+The bundle contains:
+- `debs/`: dkms, the build toolchain and all their dependencies, plus the headers for each kernel. With `--with-kernel-images` it also has the kernel image packages, which restore a deleted stock `igc.ko`;
+- `src/`: the igc source for each kernel;
+- a copy of the installer, this README and `vendor/`, so the bundle folder is self-contained. Copy it to a USB stick or to the node itself.
+
+Defaults: every kernel in `/lib/modules`, plus the newest kernel apt offers for the installed Proxmox series. Expect a few hundred MB, or more with kernel images. `bundle/` and `*.deb` are git-ignored.
+
+**2. Install offline:**
+
+```bash
+cd /path/to/bundle            # or the repo, if the bundle is in ./bundle
+sudo ./install-igc-nvmfix-dkms.sh --offline [DIR]
+```
+
+This installs only the packages from the bundle that are missing or older (it never downgrades), and never touches the network. It also:
+- creates `/etc/igc-nvmfix/offline`, so later DKMS builds don't try to download (delete it, or re-run without `--offline`, once you're back online);
+- keeps the header and kernel `.deb` files in `/usr/share/igc-nvmfix/debs/`, so `igc-nvmfix-ensure` can install headers for those kernels later without network.
+
+**Bundled sources:** `vendor/igc/` in this repo holds unmodified igc sources for **v6.8.12, v6.14.11, v6.17.13, v7.0.14 and v7.3.5** (~3 MB). They're installed to `/usr/share/igc-nvmfix/vendor`. A build uses the exact tag when available, otherwise the newest bundled source of the same series (e.g. v7.3.5 for 7.3.2). So any kernel whose **headers** are installed can be built without network. Headers are the one thing that must come from apt or a bundle.
 
 ## How it works
 

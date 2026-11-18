@@ -25,19 +25,27 @@
 # underlying NVM issue. A BIOS update / proper NVM reflash is the real fix.
 #
 # Usage:
-#   sudo ./install-igc-nvmfix-dkms.sh             install / reinstall
-#   sudo ./install-igc-nvmfix-dkms.sh --status    show DKMS + module status
-#   sudo ./install-igc-nvmfix-dkms.sh --uninstall remove, back to stock driver
+#   sudo ./install-igc-nvmfix-dkms.sh                  install / reinstall (online)
+#   sudo ./install-igc-nvmfix-dkms.sh --status         show DKMS + module status
+#   sudo ./install-igc-nvmfix-dkms.sh --uninstall      remove, back to stock driver
+#   sudo ./install-igc-nvmfix-dkms.sh --no-mac         don't pin a MAC address
 #
-# Offline / exact vendor source (optional):
-#   Put the igc driver directory for a given kernel in
-#     /etc/igc-nvmfix/src/<uname -r>/   (must contain igc_main.c, Makefile, ...)
-#   and it will be used instead of fetching from kernel.org/GitHub.
+# Offline:
+#   sudo ./install-igc-nvmfix-dkms.sh --make-bundle [DIR] [--kernels "K1 K2"] [--with-kernel-images]
+#       (on a machine WITH internet, same Debian/Proxmox release as the target)
+#       downloads dkms + build tools + headers (+ kernel images) as .deb files
+#       and the igc source for each kernel into DIR (default ./bundle).
+#   sudo ./install-igc-nvmfix-dkms.sh --offline [DIR]
+#       installs from that bundle without ANY network access.
+#
+# Bundled igc sources (vendor/igc/<tag>/) are used whenever downloading the
+# source fails, so a kernel whose headers are present can always be built.
+# An exact source for one kernel can be put in /etc/igc-nvmfix/src/<uname -r>/.
 #
 set -euo pipefail
 
 PKG="igc-nvmfix"
-PKGVER="2.6"
+PKGVER="2.7"
 SRCDIR="/usr/src/${PKG}-${PKGVER}"
 KVER="$(uname -r)"
 
@@ -47,11 +55,153 @@ die()  { echo -e "\e[1;31m[x]\e[0m $*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "Run this as root (sudo $0)"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SHARE="/usr/share/igc-nvmfix"           # persisted vendor sources + header debs
+CACHE="/var/cache/igc-nvmfix"
+OFFLINE_FLAG="/etc/igc-nvmfix/offline"
+SUB="drivers/net/ethernet/intel/igc"
+BASE_DEPS=(dkms git python3 build-essential bc flex bison libssl-dev libelf-dev
+           dwarves kmod zstd xz-utils)
+
 # ---------------------------------------------------------------------------
-# --status / --uninstall
+# Options
 # ---------------------------------------------------------------------------
-NO_MAC=0
-[[ "${1:-}" == "--no-mac" ]] && { NO_MAC=1; shift; }
+NO_MAC=0; ACTION="install"; OFFLINE=0; BUNDLE=""; KERNELS=""; WITH_IMAGES=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --no-mac)             NO_MAC=1 ;;
+        --status)             ACTION="status" ;;
+        --uninstall)          ACTION="uninstall" ;;
+        --offline)            OFFLINE=1
+                              if [[ -n "${2:-}" && "${2:0:2}" != "--" ]]; then BUNDLE="$2"; shift; fi ;;
+        --make-bundle)        ACTION="bundle"
+                              if [[ -n "${2:-}" && "${2:0:2}" != "--" ]]; then BUNDLE="$2"; shift; fi ;;
+        --kernels)            KERNELS="${2:?--kernels needs a list}"; shift ;;
+        --with-kernel-images) WITH_IMAGES=1 ;;
+        *) die "Unknown option: $1 (see the header of this script for usage)" ;;
+    esac
+    shift
+done
+
+# Sparse-fetch only the igc driver dir for one tag into DEST (network).
+fetch_igc_tag() {   # fetch_igc_tag <tag> <dest>
+    local tag="$1" dest="$2" tmp repo
+    for repo in https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
+                https://github.com/gregkh/linux.git https://github.com/torvalds/linux.git; do
+        tmp="$(mktemp -d)"
+        if timeout 300 git clone -q --depth 1 --filter=blob:none --sparse --branch "$tag" \
+                "$repo" "${tmp}/src" 2>/dev/null \
+           && timeout 300 git -C "${tmp}/src" sparse-checkout set "$SUB" 2>/dev/null \
+           && [[ -f "${tmp}/src/${SUB}/igc_main.c" ]]; then
+            rm -rf "$dest"; mkdir -p "$dest"
+            cp -a "${tmp}/src/${SUB}/." "$dest/"; touch "${dest}/.complete"
+            rm -rf "$tmp"; return 0
+        fi
+        rm -rf "$tmp"
+    done
+    return 1
+}
+
+kernel_tags() {     # 7.3.5-1-pve -> "v7.3.5 v7.3"
+    local base mm sub
+    base="$(grep -oP '^\d+\.\d+(\.\d+)?' <<<"$1")"; mm="$(grep -oP '^\d+\.\d+' <<<"$base")"
+    sub="${base#"$mm"}"; sub="${sub#.}"
+    [[ -n "$sub" && "$sub" != "0" ]] && echo -n "v${mm}.${sub} "
+    echo "v${mm}"
+}
+
+hdr_pkg_for() {     # first headers package name apt knows for a kernel
+    local p
+    for p in "proxmox-headers-$1" "pve-headers-$1" "linux-headers-$1"; do
+        apt-cache show "$p" >/dev/null 2>&1 && { echo "$p"; return 0; }
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# --make-bundle: download everything needed for an offline install
+# ---------------------------------------------------------------------------
+if [[ "$ACTION" == "bundle" ]]; then
+    BUNDLE="$(realpath -m "${BUNDLE:-${SCRIPT_DIR}/bundle}")"
+    mkdir -p "${BUNDLE}/debs" "${BUNDLE}/src"
+    if [[ -z "$KERNELS" ]]; then
+        KERNELS="$(ls /lib/modules | sort -V | tr '\n' ' ')"
+        # also the newest kernel apt offers for each installed series
+        for meta in proxmox-default-kernel proxmox-kernel-7.3 proxmox-kernel-7.0; do
+            dep="$(apt-cache depends "$meta" 2>/dev/null | grep -oP 'Depends: proxmox-kernel-\K[0-9][^ ]*-pve(?=-signed)?' | head -1 || true)"
+            [[ -n "$dep" ]] && KERNELS+=" ${dep%-signed}"
+        done
+        KERNELS="$(tr ' ' '\n' <<<"$KERNELS" | sed '/^$/d' | sort -uV | tr '\n' ' ')"
+    fi
+    log "Building offline bundle in ${BUNDLE} for kernels: ${KERNELS}"
+    apt-get update -qq || warn "apt-get update failed; using cached package lists"
+
+    PKGS=("${BASE_DEPS[@]}")
+    for k in $KERNELS; do
+        if p="$(hdr_pkg_for "$k")"; then PKGS+=("$p"); else warn "No headers package found for ${k}"; fi
+        if [[ $WITH_IMAGES -eq 1 ]]; then
+            for p in "proxmox-kernel-${k}-signed" "proxmox-kernel-${k}" "linux-image-${k}"; do
+                apt-cache show "$p" >/dev/null 2>&1 && { PKGS+=("$p"); break; }
+            done
+        fi
+    done
+
+    log "Resolving dependencies of: ${PKGS[*]}"
+    mapfile -t ALL < <(apt-cache depends --recurse --no-recommends --no-suggests \
+        --no-conflicts --no-breaks --no-replaces --no-enhances "${PKGS[@]}" 2>/dev/null \
+        | grep -E '^[a-zA-Z0-9]' | sed 's/:any$//' | sort -u)
+    log "Downloading ${#ALL[@]} packages..."
+    ( cd "${BUNDLE}/debs" && for p in "${ALL[@]}"; do apt-get download -q "$p" >/dev/null 2>&1 || true; done )
+    log "$(ls "${BUNDLE}/debs" | wc -l) .deb files, $(du -sh "${BUNDLE}/debs" | cut -f1)"
+
+    for k in $KERNELS; do
+        for t in $(kernel_tags "$k"); do
+            [[ -f "${BUNDLE}/src/${t}/.complete" ]] && break
+            if [[ -f "${SCRIPT_DIR}/vendor/igc/${t}/.complete" ]]; then
+                cp -a "${SCRIPT_DIR}/vendor/igc/${t}" "${BUNDLE}/src/"; break
+            fi
+            log "Fetching igc source ${t}..."
+            fetch_igc_tag "$t" "${BUNDLE}/src/${t}" && break
+        done
+    done
+
+    # Make the bundle self-contained
+    if [[ "$BUNDLE" != "$SCRIPT_DIR"/* ]]; then
+        cp -f "${BASH_SOURCE[0]}" "${BUNDLE}/"
+        [[ -f "${SCRIPT_DIR}/README.md" ]] && cp -f "${SCRIPT_DIR}/README.md" "${BUNDLE}/"
+        [[ -d "${SCRIPT_DIR}/vendor" ]] && cp -a "${SCRIPT_DIR}/vendor" "${BUNDLE}/"
+    fi
+    {
+        echo "created: $(date -Is) on $(hostname)"
+        echo "os: $(. /etc/os-release; echo "$PRETTY_NAME")"
+        command -v pveversion >/dev/null && echo "pve: $(pveversion)"
+        echo "kernels: ${KERNELS}"
+    } > "${BUNDLE}/BUNDLE_INFO"
+    log "Bundle ready: ${BUNDLE} ($(du -sh "$BUNDLE" | cut -f1))"
+    log "On the offline machine: sudo ./install-igc-nvmfix-dkms.sh --offline ${BUNDLE}"
+    exit 0
+fi
+
+# Install every .deb from a bundle whose package isn't installed yet (or the
+# given packages only). Never downgrades.
+install_bundle_debs() {   # install_bundle_debs <debs dir> [package-name-regex]
+    local dir="$1" filter="${2:-.}" deb name ver cur todo=()
+    for deb in "$dir"/*.deb; do
+        [[ -f "$deb" ]] || continue
+        name="$(dpkg-deb -f "$deb" Package)"; ver="$(dpkg-deb -f "$deb" Version)"
+        [[ "$name" =~ $filter ]] || continue
+        cur="$(dpkg-query -W -f='${db:Status-Abbrev} ${Version}' "$name" 2>/dev/null || true)"
+        if [[ "$cur" == ii* ]]; then
+            dpkg --compare-versions "${cur##* }" ge "$ver" && continue
+        fi
+        todo+=("$deb")
+    done
+    [[ ${#todo[@]} -gt 0 ]] || return 0
+    log "Installing ${#todo[@]} package(s) from the offline bundle..."
+    apt-get install -y --no-download --no-install-recommends "${todo[@]}" \
+        || dpkg -i "${todo[@]}" \
+        || return 1
+}
 
 # systemctl/reboot fail with "Transport endpoint is not connected" when PID 1
 # lost its control socket (typically after a systemd upgrade inside an apt run
@@ -69,8 +219,8 @@ ensure_systemd() {
     warn "systemd still not reachable. For a clean reboot use: kill -INT 1"
 }
 
-case "${1:-}" in
-    --status)
+case "$ACTION" in
+    status)
         dkms status "$PKG" 2>/dev/null || echo "dkms not installed"
         echo "Module used for ${KVER}: $(modinfo -n igc 2>/dev/null || echo 'none')"
         fb="$(grep -l "FALLBACK" /var/lib/dkms/${PKG}/*/*/*/log/make.log 2>/dev/null || true)"
@@ -78,16 +228,23 @@ case "${1:-}" in
             echo "Kernels where the patch FAILED and the stock driver was installed instead:"
             echo "$fb" | awk -F/ '{print "  - " $(NF-3)}'
         fi
+        [[ -f "$OFFLINE_FLAG" ]] && echo "Mode: OFFLINE (no network fetches; delete ${OFFLINE_FLAG} to allow them)"
+        echo "Bundled igc sources: $(ls "${SHARE}/vendor/igc" 2>/dev/null | tr '\n' ' ')"
+        echo "Cached igc sources:  $(ls "$CACHE" 2>/dev/null | tr '\n' ' ')"
+        for kdir in /lib/modules/*/; do
+            k="$(basename "$kdir")"; [[ -d "${kdir}kernel" ]] || continue
+            [[ -e "${kdir}build" ]] || echo "  ! no headers for ${k} (can't build there)"
+        done
         dmesg | grep -i igc | tail -10 || true
         exit 0
         ;;
-    --uninstall)
+    uninstall)
         log "Removing all ${PKG} DKMS versions..."
         for v in $(dkms status "$PKG" 2>/dev/null | grep -oP "^${PKG}[/, ]+\K[0-9.]+" | sort -u); do
             dkms remove -m "$PKG" -v "$v" --all || true
             rm -rf "/usr/src/${PKG}-${v}"
         done
-        rm -rf /var/cache/igc-nvmfix
+        rm -rf "$CACHE" "$SHARE" "$OFFLINE_FLAG"
         rm -f "/usr/share/dkms/modules_to_force_install/${PKG}"
         systemctl disable igc-nvmfix-ensure.service >/dev/null 2>&1 || true
         rm -f /etc/systemd/system/igc-nvmfix-ensure.service /usr/sbin/igc-nvmfix-ensure \
@@ -107,9 +264,19 @@ case "${1:-}" in
         warn "Reboot (or 'rmmod igc; modprobe igc') to load the stock driver."
         exit 0
         ;;
-    "") ;;
-    *) die "Unknown option: $1 (use --status, --uninstall or --no-mac)" ;;
 esac
+
+if [[ $OFFLINE -eq 1 ]]; then
+    # Default bundle location: ./bundle next to the script, or the script dir
+    # itself when the script was started from inside a bundle.
+    if [[ -z "$BUNDLE" ]]; then
+        if [[ -d "${SCRIPT_DIR}/bundle/debs" ]]; then BUNDLE="${SCRIPT_DIR}/bundle"; else BUNDLE="$SCRIPT_DIR"; fi
+    fi
+    BUNDLE="$(realpath -m "$BUNDLE")"
+    [[ -d "${BUNDLE}/debs" ]] || die "No offline bundle at ${BUNDLE} (expected ${BUNDLE}/debs). Create one with --make-bundle on a machine with internet."
+    log "OFFLINE mode, bundle: ${BUNDLE}"
+    [[ -f "${BUNDLE}/BUNDLE_INFO" ]] && sed 's/^/    /' "${BUNDLE}/BUNDLE_INFO"
+fi
 
 # ---------------------------------------------------------------------------
 # 0. Sanity checks
@@ -176,6 +343,33 @@ ensure_systemd
 # ---------------------------------------------------------------------------
 # 2. Dependencies (+ headers metapackage so FUTURE kernels get headers too)
 # ---------------------------------------------------------------------------
+# Persist bundled sources so future kernel builds work without network
+mkdir -p "${SHARE}/vendor/igc" "$CACHE" /etc/igc-nvmfix/src
+[[ -d "${SCRIPT_DIR}/vendor/igc" ]] && cp -a "${SCRIPT_DIR}/vendor/igc/." "${SHARE}/vendor/igc/"
+if [[ $OFFLINE -eq 1 ]]; then
+    [[ -d "${BUNDLE}/vendor/igc" ]] && cp -a "${BUNDLE}/vendor/igc/." "${SHARE}/vendor/igc/"
+    [[ -d "${BUNDLE}/src" ]] && cp -a "${BUNDLE}/src/." "${CACHE}/"
+fi
+
+if [[ $OFFLINE -eq 1 ]]; then
+    touch "$OFFLINE_FLAG"
+    # Keep the header (+ kernel image) debs locally, so igc-nvmfix-ensure can
+    # use them later without network.
+    mkdir -p "${SHARE}/debs"
+    cp -f "${BUNDLE}"/debs/{proxmox-headers,pve-headers,linux-headers,proxmox-kernel,linux-image}-*.deb \
+        "${SHARE}/debs/" 2>/dev/null || true
+
+    install_bundle_debs "${BUNDLE}/debs" \
+        || die "Installing packages from the bundle failed. Was it made on the same OS release?"
+    for d in "${BASE_DEPS[@]}"; do
+        dpkg -s "$d" >/dev/null 2>&1 || die "Required package '${d}' missing and not in the bundle."
+    done
+    [[ -e "/lib/modules/${KVER}/build" ]] \
+        || die "No headers for the running kernel ${KVER} in the bundle. Re-make it with: --make-bundle --kernels \"${KVER}\""
+fi
+
+if [[ $OFFLINE -eq 0 ]]; then
+rm -f "$OFFLINE_FLAG"
 log "Installing DKMS and build dependencies..."
 apt-get update -qq
 
@@ -197,8 +391,7 @@ else
     fi
 fi
 
-apt-get install -y dkms git python3 build-essential bc flex bison \
-    libssl-dev libelf-dev dwarves kmod zstd xz-utils "$CUR_HDR" \
+apt-get install -y "${BASE_DEPS[@]}" "$CUR_HDR" \
     || die "Failed to install dependencies (is ${CUR_HDR} available? 'apt list *headers*')"
 
 if [[ -n "$HDR_META" ]]; then
@@ -208,6 +401,7 @@ else
     warn "No headers metapackage found for this kernel flavour."
     warn "Make sure linux-headers for each NEW kernel get installed, or DKMS can't rebuild."
 fi
+fi  # online
 
 [[ -d "/lib/modules/${KVER}/build" ]] || die "/lib/modules/${KVER}/build missing after header install."
 
@@ -221,7 +415,15 @@ for kdir in /lib/modules/*/; do
     [[ -d "${kdir}kernel/drivers/net" ]] || continue
     ls "${kdir}kernel/drivers/net/ethernet/intel/igc/"igc.ko* >/dev/null 2>&1 && continue
     owner="$(dpkg -S "/boot/vmlinuz-${k}" 2>/dev/null | head -1 | cut -d: -f1 | cut -d, -f1)"
-    if [[ -n "$owner" ]]; then
+    if [[ -n "$owner" && $OFFLINE -eq 1 ]]; then
+        deb="$(ls "${BUNDLE}/debs/${owner}_"*.deb 2>/dev/null | head -1 || true)"
+        if [[ -n "$deb" ]]; then
+            warn "Stock igc.ko missing for ${k} - reinstalling ${owner} from the bundle..."
+            dpkg -i "$deb" || warn "Reinstall of ${owner} failed."
+        else
+            warn "Stock igc.ko missing for ${k}; ${owner} is not in the bundle (use --with-kernel-images)."
+        fi
+    elif [[ -n "$owner" ]]; then
         warn "Stock igc.ko missing for ${k} - reinstalling ${owner} to restore it..."
         apt-get install -y --reinstall "$owner" \
             || warn "Reinstall of ${owner} failed; ${k} has no stock igc driver."
@@ -304,6 +506,8 @@ set -euo pipefail
 KVER="${1:?kernel version required}"
 BUILD_DIR="$(pwd)"
 CACHE="/var/cache/igc-nvmfix"
+VENDOR="/usr/share/igc-nvmfix/vendor/igc"
+OFFLINE_FLAG="/etc/igc-nvmfix/offline"
 HDR="/lib/modules/${KVER}/build"
 SUB="drivers/net/ethernet/intel/igc"
 REPOS=(
@@ -330,9 +534,9 @@ fetch_tag() {   # prints cache dir on success
     for repo in "${REPOS[@]}"; do
         log "Fetching ${SUB} @ ${tag} from ${repo} ..."
         tmp="$(mktemp -d)"
-        if git clone -q --depth 1 --filter=blob:none --sparse --branch "$tag" \
+        if timeout 300 git clone -q --depth 1 --filter=blob:none --sparse --branch "$tag" \
                 "$repo" "${tmp}/src" 2>/dev/null \
-           && git -C "${tmp}/src" sparse-checkout set "$SUB" 2>/dev/null \
+           && timeout 300 git -C "${tmp}/src" sparse-checkout set "$SUB" 2>/dev/null \
            && [[ -f "${tmp}/src/${SUB}/igc_main.c" ]]; then
             rm -rf "$dest"; mkdir -p "$dest"
             cp -a "${tmp}/src/${SUB}/." "$dest/"
@@ -345,17 +549,42 @@ fetch_tag() {   # prints cache dir on success
     return 1
 }
 
+# Highest local source (cache or bundled vendor) of the same major.minor
+nearest_local() {
+    local d best
+    best="$(for d in "$CACHE"/v"${mm}"* "$VENDOR"/v"${mm}"*; do
+                [[ -f "${d}/.complete" ]] || continue
+                [[ "$(basename "$d")" =~ ^v${mm//./\\.}(\.[0-9]+)?$ ]] || continue
+                echo "$(basename "$d") ${d}"
+            done | sort -V | tail -1 | cut -d' ' -f2-)"
+    [[ -n "$best" ]] && echo "$best"
+}
+
 SRC=""
 if [[ -f "/etc/igc-nvmfix/src/${KVER}/igc_main.c" ]]; then
     SRC="/etc/igc-nvmfix/src/${KVER}"
     log "Using local override source ${SRC}"
-else
+fi
+# 1. exact tag already available locally (cache, then bundled vendor)
+if [[ -z "$SRC" ]]; then
+    for t in "${TAGS[@]}"; do
+        for d in "${CACHE}/${t}" "${VENDOR}/${t}"; do
+            [[ -f "${d}/.complete" ]] && { SRC="$d"; log "Using local source ${d}"; break 2; }
+        done
+    done
+fi
+# 2. download (unless offline mode)
+if [[ -z "$SRC" && ! -f "$OFFLINE_FLAG" ]]; then
     for t in "${TAGS[@]}"; do
         if SRC="$(fetch_tag "$t")"; then log "Using upstream source ${t}"; break; fi
         SRC=""
     done
 fi
-[[ -n "$SRC" ]] || { log "Could not obtain igc source for ${KVER} (tried: ${TAGS[*]}). Network down?"; exit 1; }
+# 3. offline / no network: nearest local source of the same series
+if [[ -z "$SRC" ]] && SRC="$(nearest_local)"; then
+    log "No exact source for ${KVER}; using nearest local source ${SRC} (same ${mm} series)"
+fi
+[[ -n "$SRC" ]] || { log "No igc source for ${KVER} (tried: ${TAGS[*]}, no local v${mm}.x). Offline? Add one with --make-bundle."; exit 1; }
 
 # Copy driver source into the build dir (keep our own helper files)
 find "$SRC" -maxdepth 1 -type f \( -name '*.c' -o -name '*.h' -o -name 'Makefile' \) \
@@ -475,7 +704,13 @@ for kdir in /lib/modules/*/; do
     k="$(basename "$kdir")"
     [[ -d "${kdir}kernel" ]] || continue
     if [[ ! -e "${kdir}build" ]]; then
-        if p="$(hdr_pkg "$k")"; then
+        deb="$(ls /usr/share/igc-nvmfix/debs/{proxmox,pve,linux}-headers-"${k}"_*.deb 2>/dev/null | head -1)"
+        if [[ -n "$deb" ]]; then
+            log "Installing missing headers for ${k} from local bundle: ${deb##*/}"
+            dpkg -i "$deb" || log "could not install ${deb}"
+        elif [[ -f /etc/igc-nvmfix/offline ]]; then
+            log "OFFLINE: no headers for ${k}. Make a bundle with: --make-bundle --kernels \"${k}\""
+        elif p="$(hdr_pkg "$k")"; then
             log "Installing missing headers for ${k}: ${p}"
             DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=900 install -y "$p" \
                 || log "could not install ${p}"
@@ -644,6 +879,11 @@ dkms status "$PKG"
 echo
 log "From now on every new kernel gets the patched igc automatically (DKMS autoinstall)."
 log "Check anytime with: sudo $0 --status"
-warn "Building on a new kernel needs network access (source is cached in /var/cache/igc-nvmfix)."
+if [[ $OFFLINE -eq 1 ]]; then
+    warn "OFFLINE mode: new kernels build from bundled/cached sources only, and need their"
+    warn "headers installed (or in a bundle). Back online? Re-run without --offline."
+else
+    warn "Sources are cached in ${CACHE}; bundled sources in ${SHARE}/vendor are used when offline."
+fi
 warn "If a future build fails, the stock (unpatched) igc is installed for that kernel instead,"
 warn "so apt never breaks. '$0 --status' lists such kernels."
