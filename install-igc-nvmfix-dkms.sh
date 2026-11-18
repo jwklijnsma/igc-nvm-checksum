@@ -37,7 +37,7 @@
 set -euo pipefail
 
 PKG="igc-nvmfix"
-PKGVER="2.1"
+PKGVER="2.2"
 SRCDIR="/usr/src/${PKG}-${PKGVER}"
 KVER="$(uname -r)"
 
@@ -385,9 +385,25 @@ fi
 MODPATH="$(modinfo -n igc 2>/dev/null || true)"
 [[ "$MODPATH" == *updates* ]] || warn "modinfo resolves igc to '${MODPATH}', not the DKMS copy - check 'depmod -a'."
 
-log "Reloading igc module..."
-rmmod igc 2>/dev/null || warn "igc was not loaded or rmmod failed (continuing)"
-modprobe igc || die "modprobe igc failed - check 'dmesg | tail'"
+log "Reloading igc module (network on igc ports drops for a few seconds)..."
+# Run reload + network re-apply detached, so it completes even if this SSH
+# session runs over an igc port and gets cut off.
+nohup bash -c '
+    rmmod igc 2>/dev/null
+    modprobe igc || exit 1
+    sleep 3
+    # Re-attach igc ports to bridges/bonds (Proxmox vmbr*): rmmod removes
+    # them and they are NOT re-added automatically.
+    if command -v ifreload >/dev/null 2>&1; then
+        ifreload -a
+    elif command -v netplan >/dev/null 2>&1; then
+        netplan apply
+    elif systemctl is-active -q networking; then
+        systemctl restart networking
+    fi
+' > /var/log/igc-nvmfix-reload.log 2>&1 &
+wait $! || die "Reloading igc failed - see /var/log/igc-nvmfix-reload.log and 'dmesg | tail'"
+MODPATH="$(modinfo -n igc 2>/dev/null || true)"
 
 # Secure Boot hint
 if command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null | grep -qi enabled; then
