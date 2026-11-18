@@ -37,7 +37,7 @@
 set -euo pipefail
 
 PKG="igc-nvmfix"
-PKGVER="2.5"
+PKGVER="2.6"
 SRCDIR="/usr/src/${PKG}-${PKGVER}"
 KVER="$(uname -r)"
 
@@ -89,6 +89,10 @@ case "${1:-}" in
         done
         rm -rf /var/cache/igc-nvmfix
         rm -f "/usr/share/dkms/modules_to_force_install/${PKG}"
+        systemctl disable igc-nvmfix-ensure.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/igc-nvmfix-ensure.service /usr/sbin/igc-nvmfix-ensure \
+              /etc/apt/apt.conf.d/99igc-nvmfix
+        systemctl daemon-reload 2>/dev/null || true
         if grep -l "^# managed by igc-nvmfix" /etc/systemd/network/*.link >/dev/null 2>&1; then
             warn "Keeping the MAC address .link files created by igc-nvmfix:"
             grep -l "^# managed by igc-nvmfix" /etc/systemd/network/*.link | sed 's/^/    /'
@@ -438,15 +442,99 @@ if grep -q FALLBACK "/var/lib/dkms/${PKG}/${PKGVER}/build/make.log" 2>/dev/null;
 fi
 dkms install -m "$PKG" -v "$PKGVER" -k "$KVER" --force
 
-# Kernels already installed but not booted yet (e.g. pending upgrade)
+# ---------------------------------------------------------------------------
+# 4b. Self-healing for ALL kernels: headers + build, after apt and at boot
+# ---------------------------------------------------------------------------
+# DKMS silently skips kernels without headers. Headers metapackages only
+# track the DEFAULT kernel series (e.g. proxmox-default-headers), so opt-in
+# kernels (Proxmox 7.3 on a 7.0 default, HWE, ...) end up with the stock,
+# failing igc. igc-nvmfix-ensure installs missing headers and builds for
+# every installed kernel; it runs after every apt run and at boot.
+cat > /usr/sbin/igc-nvmfix-ensure <<'ENSURE'
+#!/usr/bin/env bash
+# igc-nvmfix-ensure [--reload]
+# Make sure every installed kernel has headers and the patched igc module.
+# --reload: if the running kernel just got the module, load it + re-apply network.
+set -u
+PKG="igc-nvmfix"
+log() { echo "[igc-nvmfix-ensure] $*"; }
+VER="$(ls -d /usr/src/${PKG}-* 2>/dev/null | sed "s#.*/${PKG}-##" | sort -V | tail -1)"
+[[ -n "$VER" ]] || { log "no ${PKG} source in /usr/src; nothing to do"; exit 0; }
+
+hdr_pkg() {
+    local p
+    for p in "proxmox-headers-$1" "pve-headers-$1" "linux-headers-$1"; do
+        apt-cache show "$p" >/dev/null 2>&1 && { echo "$p"; return 0; }
+    done
+    return 1
+}
+
+RUNNING="$(uname -r)"
+CHANGED_RUNNING=0
 for kdir in /lib/modules/*/; do
     k="$(basename "$kdir")"
-    [[ "$k" == "$KVER" || ! -d "${kdir}build" ]] && continue
-    log "Also building for installed kernel ${k}..."
-    { dkms build -m "$PKG" -v "$PKGVER" -k "$k" && \
-      dkms install -m "$PKG" -v "$PKGVER" -k "$k" --force; } \
-        || warn "Build for ${k} failed (stock igc will be used there)."
+    [[ -d "${kdir}kernel" ]] || continue
+    if [[ ! -e "${kdir}build" ]]; then
+        if p="$(hdr_pkg "$k")"; then
+            log "Installing missing headers for ${k}: ${p}"
+            DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=900 install -y "$p" \
+                || log "could not install ${p}"
+        else
+            log "No headers package found for ${k}; skipping"
+        fi
+    fi
+    [[ -e "${kdir}build" ]] || continue
+    if dkms status -m "$PKG" -v "$VER" -k "$k" 2>/dev/null | grep -q installed; then
+        continue
+    fi
+    log "Building ${PKG}/${VER} for ${k}..."
+    if dkms install -m "$PKG" -v "$VER" -k "$k" --force; then
+        command -v update-initramfs >/dev/null && update-initramfs -u -k "$k"
+        [[ "$k" == "$RUNNING" ]] && CHANGED_RUNNING=1
+    else
+        log "build/install for ${k} failed"
+    fi
 done
+
+if [[ "${1:-}" == "--reload" ]]; then
+    if [[ "$(modinfo -n igc 2>/dev/null)" == *updates* ]] && \
+       { [[ $CHANGED_RUNNING -eq 1 ]] || ! ls /sys/bus/pci/drivers/igc/0000:* >/dev/null 2>&1; }; then
+        log "Loading patched igc for ${RUNNING}..."
+        rmmod igc 2>/dev/null
+        modprobe igc && sleep 3
+        command -v ifreload >/dev/null && ifreload -a
+    fi
+fi
+exit 0
+ENSURE
+chmod 755 /usr/sbin/igc-nvmfix-ensure
+
+cat > /etc/systemd/system/igc-nvmfix-ensure.service <<'UNIT'
+[Unit]
+Description=Ensure the patched igc driver (igc-nvmfix) is built for all kernels
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/igc-nvmfix-ensure --reload
+TimeoutStartSec=30min
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# After every apt/dpkg run: schedule an ensure run (detached, waits for the
+# apt lock), so headers for newly installed kernels get installed too.
+cat > /etc/apt/apt.conf.d/99igc-nvmfix <<'APT'
+DPkg::Post-Invoke { "if [ -x /usr/sbin/igc-nvmfix-ensure ] && command -v systemd-run >/dev/null; then systemd-run --quiet --no-block --collect --unit=igc-nvmfix-ensure-apt --on-active=30 /usr/sbin/igc-nvmfix-ensure >/dev/null 2>&1 || true; fi"; };
+APT
+
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable igc-nvmfix-ensure.service >/dev/null 2>&1 || warn "could not enable igc-nvmfix-ensure.service"
+
+log "Installing headers + building for all other installed kernels..."
+/usr/sbin/igc-nvmfix-ensure || true
 
 # ---------------------------------------------------------------------------
 # 5. Unique MAC for ports whose NVM has no valid MAC

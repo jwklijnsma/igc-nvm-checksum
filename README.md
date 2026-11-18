@@ -38,6 +38,14 @@ sudo ./install-igc-nvmfix-dkms.sh
 4. Installs the module into `/lib/modules/<kver>/updates/dkms`, which takes priority over the in-tree driver. **The stock driver is never overwritten.**
 5. Updates the initramfs and reloads `igc`.
 
+### Every kernel, including opt-in kernels
+
+Headers metapackages only follow the **default** kernel series. `proxmox-default-headers` won't pull headers for an opt-in kernel, for example 7.3 when 7.0 is the default, and DKMS silently skips kernels without headers. You then boot into the stock driver and get `probe ... failed with error -5`. To prevent that the installer adds:
+
+- `/usr/sbin/igc-nvmfix-ensure`: installs missing headers (`proxmox-headers-<kver>` / `linux-headers-<kver>`) and builds the module for **every** installed kernel;
+- an APT hook (`/etc/apt/apt.conf.d/99igc-nvmfix`) that runs it in the background 30 s after each apt/dpkg run, so a newly installed kernel gets headers and the module before you reboot;
+- `igc-nvmfix-ensure.service`, which runs it at boot. If the running kernel only got the module then, it loads it and runs `ifreload -a`. This needs network through another NIC (or a cached source plus headers already installed).
+
 ### Kernel upgrades never break apt
 
 A failing DKMS build makes the kernel package's postinst fail, which leaves dpkg half-configured. To prevent that:
