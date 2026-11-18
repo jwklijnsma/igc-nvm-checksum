@@ -114,6 +114,14 @@ systemctl reboot
 kill -INT 1
 ```
 
+## `modprobe: FATAL: Module igc not found`
+
+Earlier scripts deleted or overwrote the kernel's own `igc.ko`. Once the old DKMS package is removed, no igc driver is left. The installer detects this for every installed kernel and reinstalls the kernel package that owns it, which restores the stock driver. To do it by hand:
+
+```bash
+apt install --reinstall "$(dpkg -S /boot/vmlinuz-$(uname -r) | cut -d: -f1)"
+```
+
 ## Troubleshooting
 
 ```bash

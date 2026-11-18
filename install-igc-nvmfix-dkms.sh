@@ -37,7 +37,7 @@
 set -euo pipefail
 
 PKG="igc-nvmfix"
-PKGVER="2.4"
+PKGVER="2.5"
 SRCDIR="/usr/src/${PKG}-${PKGVER}"
 KVER="$(uname -r)"
 
@@ -206,6 +206,27 @@ else
 fi
 
 [[ -d "/lib/modules/${KVER}/build" ]] || die "/lib/modules/${KVER}/build missing after header install."
+
+# Earlier scripts (the original non-DKMS one, igc-patched, ...) deleted or
+# overwrote the in-tree igc.ko. Without it there is no driver at all once the
+# old package is removed, and our stock fallback has nothing to fall back to.
+# Reinstall the kernel package that owns it, for every installed kernel.
+log "Checking that every installed kernel still has its stock igc driver..."
+for kdir in /lib/modules/*/; do
+    k="$(basename "$kdir")"
+    [[ -d "${kdir}kernel/drivers/net" ]] || continue
+    ls "${kdir}kernel/drivers/net/ethernet/intel/igc/"igc.ko* >/dev/null 2>&1 && continue
+    owner="$(dpkg -S "/boot/vmlinuz-${k}" 2>/dev/null | head -1 | cut -d: -f1 | cut -d, -f1)"
+    if [[ -n "$owner" ]]; then
+        warn "Stock igc.ko missing for ${k} - reinstalling ${owner} to restore it..."
+        apt-get install -y --reinstall "$owner" \
+            || warn "Reinstall of ${owner} failed; ${k} has no stock igc driver."
+    else
+        warn "Stock igc.ko missing for ${k} and no owning package found."
+    fi
+done
+ls "/lib/modules/${KVER}/kernel/drivers/net/ethernet/intel/igc/"igc.ko* >/dev/null 2>&1 \
+    || warn "Running kernel ${KVER} still has no stock igc.ko; continuing with the patched build."
 
 # ---------------------------------------------------------------------------
 # 3. Write the DKMS source tree
