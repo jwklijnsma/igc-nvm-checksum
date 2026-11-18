@@ -37,6 +37,14 @@ sudo ./install-igc-nvmfix-dkms.sh
 4. Installs the module into `/lib/modules/<kver>/updates/dkms`, which takes priority over the in-tree driver. **The stock driver is never overwritten.**
 5. Updates the initramfs and reloads `igc`.
 
+### Kernel upgrades never break apt
+
+A failing DKMS build makes the kernel package's postinst fail, which leaves dpkg half-configured. To prevent that:
+
+- if fetching, patching or compiling fails for a **new** kernel, the build installs the **stock** igc driver for that kernel and logs `FALLBACK` in its `make.log`. The kernel upgrade completes normally, but the bypass is not active on that kernel. `--status` lists such kernels;
+- `/usr/share/dkms/modules_to_force_install/igc-nvmfix` tells DKMS to skip its "module already installed" version check, so the stock fallback isn't refused;
+- for the **running** kernel the installer still fails hard, so you notice right away.
+
 After loading you'll see this instead of the probe failure:
 
 ```
@@ -55,6 +63,23 @@ igc 0000:xx:00.0: The NVM Checksum Is Not Valid (ignoring, patched driver)
 - **Exact vendor source / offline:** place the igc driver directory for a kernel in `/etc/igc-nvmfix/src/<uname -r>/` (with `igc_main.c`, `Makefile`, …) and it's used instead of downloading.
 - **Secure Boot:** the module must be signed with an enrolled MOK. If `modprobe` reports `Key was rejected`, run `mokutil --import /var/lib/dkms/mok.pub` and reboot to enroll.
 - **Coming from the old non-DKMS script:** that script overwrote the in-tree `igc.ko` for the running kernel. The DKMS copy takes priority anyway, but to restore the original, reinstall the kernel package or copy it back from `/root/igc-backup-*`.
+
+## Recovering a broken apt (`igc-nvmfix/1.0 ... bad exit status`)
+
+Older 1.0 versions of this module made kernel installs fail, with errors like:
+
+```
+Autoinstall on 7.0.14-28-pve failed for module(s) igc-nvmfix(10).
+dpkg: error processing package proxmox-kernel-7.0.14-28-pve-signed (--configure)
+```
+
+Running the current installer fixes this: it removes every older `igc-nvmfix` version, runs `dpkg --configure -a` and then builds 2.1 for all installed kernels. To fix it by hand:
+
+```bash
+dkms remove igc-nvmfix/1.0 --all
+rm -rf /usr/src/igc-nvmfix-1.0
+dpkg --configure -a
+```
 
 ## Troubleshooting
 

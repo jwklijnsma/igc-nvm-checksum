@@ -37,7 +37,7 @@
 set -euo pipefail
 
 PKG="igc-nvmfix"
-PKGVER="2.0"
+PKGVER="2.1"
 SRCDIR="/usr/src/${PKG}-${PKGVER}"
 KVER="$(uname -r)"
 
@@ -54,6 +54,11 @@ case "${1:-}" in
     --status)
         dkms status "$PKG" 2>/dev/null || echo "dkms not installed"
         echo "Module used for ${KVER}: $(modinfo -n igc 2>/dev/null || echo 'none')"
+        fb="$(grep -l "FALLBACK" /var/lib/dkms/${PKG}/*/*/*/log/make.log 2>/dev/null || true)"
+        if [[ -n "$fb" ]]; then
+            echo "Kernels where the patch FAILED and the stock driver was installed instead:"
+            echo "$fb" | awk -F/ '{print "  - " $(NF-3)}'
+        fi
         dmesg | grep -i igc | tail -10 || true
         exit 0
         ;;
@@ -64,6 +69,7 @@ case "${1:-}" in
             rm -rf "/usr/src/${PKG}-${v}"
         done
         rm -rf /var/cache/igc-nvmfix
+        rm -f "/usr/share/dkms/modules_to_force_install/${PKG}"
         depmod -a "$KVER"
         command -v update-initramfs >/dev/null && update-initramfs -u -k "$KVER" || true
         log "Removed. Module now resolves to: $(modinfo -n igc 2>/dev/null || echo 'none')"
@@ -96,7 +102,22 @@ if [[ -f "$KCONFIG" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 1. Dependencies (+ headers metapackage so FUTURE kernels get headers too)
+# 1. Remove older igc-nvmfix versions FIRST and repair dpkg.
+#    A broken older version makes kernel postinst (and thus apt) fail, which
+#    would also make our own apt-get calls below fail.
+# ---------------------------------------------------------------------------
+if command -v dkms >/dev/null 2>&1; then
+    for v in $(dkms status "$PKG" 2>/dev/null | grep -oP "^${PKG}[/, ]+\K[0-9.]+" | sort -u); do
+        log "Removing existing ${PKG}/${v} from DKMS..."
+        dkms remove -m "$PKG" -v "$v" --all >/dev/null 2>&1 || true
+        rm -rf "/usr/src/${PKG}-${v}"
+    done
+fi
+log "Finishing any interrupted package configuration (dpkg --configure -a)..."
+dpkg --configure -a || warn "dpkg --configure -a reported errors; continuing"
+
+# ---------------------------------------------------------------------------
+# 2. Dependencies (+ headers metapackage so FUTURE kernels get headers too)
 # ---------------------------------------------------------------------------
 log "Installing DKMS and build dependencies..."
 apt-get update -qq
@@ -120,7 +141,7 @@ else
 fi
 
 apt-get install -y dkms git python3 build-essential bc flex bison \
-    libssl-dev libelf-dev dwarves kmod "$CUR_HDR" \
+    libssl-dev libelf-dev dwarves kmod zstd xz-utils "$CUR_HDR" \
     || die "Failed to install dependencies (is ${CUR_HDR} available? 'apt list *headers*')"
 
 if [[ -n "$HDR_META" ]]; then
@@ -134,15 +155,9 @@ fi
 [[ -d "/lib/modules/${KVER}/build" ]] || die "/lib/modules/${KVER}/build missing after header install."
 
 # ---------------------------------------------------------------------------
-# 2. Write the DKMS source tree
+# 3. Write the DKMS source tree
 # ---------------------------------------------------------------------------
 log "Writing DKMS package to ${SRCDIR}..."
-
-# Remove any older/same version already registered
-for v in $(dkms status "$PKG" 2>/dev/null | grep -oP "^${PKG}[/, ]+\K[0-9.]+" | sort -u); do
-    dkms remove -m "$PKG" -v "$v" --all >/dev/null 2>&1 || true
-    [[ "$v" != "$PKGVER" ]] && rm -rf "/usr/src/${PKG}-${v}"
-done
 rm -rf "$SRCDIR"
 mkdir -p "$SRCDIR" /etc/igc-nvmfix/src
 
@@ -152,7 +167,7 @@ PACKAGE_VERSION="${PKGVER}"
 BUILT_MODULE_NAME[0]="igc"
 DEST_MODULE_LOCATION[0]="/updates/dkms"
 PRE_BUILD="igc-prepare.sh \${kernelver}"
-MAKE[0]="make -C \${kernel_source_dir} M=\${dkms_tree}/\${PACKAGE_NAME}/\${PACKAGE_VERSION}/build modules"
+MAKE[0]="bash ./igc-build.sh \${kernelver} \${kernel_source_dir}"
 CLEAN="true"
 AUTOINSTALL="yes"
 EOF
@@ -160,10 +175,52 @@ EOF
 # Placeholder; replaced by the upstream igc Makefile during PRE_BUILD
 echo "# replaced by igc-prepare.sh" > "${SRCDIR}/Makefile"
 
-# ---- PRE_BUILD: fetch source for the target kernel and patch it -----------
-cat > "${SRCDIR}/igc-prepare.sh" <<'PREP'
+# ---- PRE_BUILD wrapper: never fails, records failure for igc-build.sh -----
+cat > "${SRCDIR}/igc-prepare.sh" <<'WRAP'
 #!/usr/bin/env bash
 # DKMS PRE_BUILD hook: igc-prepare.sh <kernelver>   (cwd = DKMS build dir)
+# Must never fail: a failing DKMS build makes the kernel package's postinst
+# fail and leaves apt/dpkg broken. On error, igc-build.sh installs the stock
+# driver instead.
+rm -f .igc-prepare-failed
+if ! bash ./igc-fetch-patch.sh "$1"; then
+    touch .igc-prepare-failed
+    echo "[igc-nvmfix] prepare failed for $1 - will fall back to stock igc" >&2
+fi
+exit 0
+WRAP
+
+# ---- MAKE: build patched module, or fall back to the stock module ---------
+cat > "${SRCDIR}/igc-build.sh" <<'BUILD'
+#!/usr/bin/env bash
+# DKMS MAKE: igc-build.sh <kernelver> <kernel_source_dir>   (cwd = build dir)
+KVER="$1"; KSRC="$2"; B="$(pwd)"
+log() { echo "[igc-nvmfix] $*"; }
+
+fallback() {
+    log "FALLBACK: $1"
+    log "FALLBACK: installing the STOCK igc driver for ${KVER} so the kernel install doesn't break."
+    log "FALLBACK: the NVM checksum bypass is NOT active on ${KVER}!"
+    local stock
+    stock="$(ls /lib/modules/"${KVER}"/kernel/drivers/net/ethernet/intel/igc/igc.ko* 2>/dev/null | head -1)"
+    [[ -n "$stock" ]] || { log "No stock igc module found for ${KVER}"; exit 1; }
+    case "$stock" in
+        *.zst) zstd -dqf "$stock" -o "${B}/igc.ko" ;;
+        *.xz)  xz -dc "$stock" > "${B}/igc.ko" ;;
+        *.gz)  gzip -dc "$stock" > "${B}/igc.ko" ;;
+        *)     cp -f "$stock" "${B}/igc.ko" ;;
+    esac
+    exit 0
+}
+
+[[ -f .igc-prepare-failed ]] && fallback "fetching or patching the igc source failed"
+make -C "$KSRC" M="$B" modules || fallback "compiling the patched igc failed"
+BUILD
+
+# ---- Fetch source for the target kernel and patch it ----------------------
+cat > "${SRCDIR}/igc-fetch-patch.sh" <<'PREP'
+#!/usr/bin/env bash
+# igc-fetch-patch.sh <kernelver>   (cwd = DKMS build dir)
 set -euo pipefail
 
 KVER="${1:?kernel version required}"
@@ -282,10 +339,16 @@ except FileNotFoundError:
 open(main_c, "w").write(src)
 PYEOF
 
-chmod 755 "${SRCDIR}/igc-prepare.sh" "${SRCDIR}/igc-patch.py"
+chmod 755 "${SRCDIR}"/*.sh "${SRCDIR}/igc-patch.py"
+
+# Skip DKMS's "module already installed / not newer" check for this package.
+# Without it, the stock-driver fallback (identical to the in-tree module)
+# would be refused during autoinstall and break the kernel install again.
+mkdir -p /usr/share/dkms/modules_to_force_install
+echo "${PKG}_version-override" > "/usr/share/dkms/modules_to_force_install/${PKG}"
 
 # ---------------------------------------------------------------------------
-# 3. Register, build and install for the running kernel (+ other installed ones)
+# 4. Register, build and install for the running kernel (+ other installed ones)
 # ---------------------------------------------------------------------------
 log "Registering with DKMS..."
 dkms add -m "$PKG" -v "$PKGVER"
@@ -294,6 +357,10 @@ log "Building for running kernel ${KVER}..."
 if ! dkms build -m "$PKG" -v "$PKGVER" -k "$KVER"; then
     LOGF="/var/lib/dkms/${PKG}/${PKGVER}/build/make.log"
     die "DKMS build failed for ${KVER}. See ${LOGF}"
+fi
+if grep -q FALLBACK "/var/lib/dkms/${PKG}/${PKGVER}/build/make.log" 2>/dev/null; then
+    grep FALLBACK "/var/lib/dkms/${PKG}/${PKGVER}/build/make.log" >&2
+    die "Patched build failed for the running kernel ${KVER} (see /var/lib/dkms/${PKG}/${PKGVER}/build/make.log). Not installing."
 fi
 dkms install -m "$PKG" -v "$PKGVER" -k "$KVER" --force
 
@@ -308,7 +375,7 @@ for kdir in /lib/modules/*/; do
 done
 
 # ---------------------------------------------------------------------------
-# 4. initramfs + reload
+# 5. initramfs + reload
 # ---------------------------------------------------------------------------
 if command -v update-initramfs >/dev/null 2>&1; then
     log "Updating initramfs..."
@@ -338,4 +405,5 @@ echo
 log "From now on every new kernel gets the patched igc automatically (DKMS autoinstall)."
 log "Check anytime with: sudo $0 --status"
 warn "Building on a new kernel needs network access (source is cached in /var/cache/igc-nvmfix)."
-warn "If a future build fails, the stock (unpatched) igc is used for that kernel - check 'dkms status'."
+warn "If a future build fails, the stock (unpatched) igc is installed for that kernel instead,"
+warn "so apt never breaks. '$0 --status' lists such kernels."
