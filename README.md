@@ -88,11 +88,12 @@ Autoinstall on 7.0.14-28-pve failed for module(s) igc-nvmfix(10).
 dpkg: error processing package proxmox-kernel-7.0.14-28-pve-signed (--configure)
 ```
 
-Running the current installer fixes this: it removes every older `igc-nvmfix` version, runs `dpkg --configure -a` and then builds the current version for all installed kernels. To fix it by hand:
+The same happens with other earlier attempts, e.g. `igc-patched/1.0`. Running the current installer fixes this: it removes every older `igc-nvmfix` version **and any other DKMS package that builds an `igc` module**, runs `dpkg --configure -a` and then builds the current version for all installed kernels. To fix it by hand:
 
 ```bash
-dkms remove igc-nvmfix/1.0 --all
-rm -rf /usr/src/igc-nvmfix-1.0
+dkms status                                  # find the failing igc module + version
+dkms remove igc-patched/1.0 --all            # repeat for each old igc package
+rm -rf /usr/src/igc-patched-1.0
 dpkg --configure -a
 ```
 

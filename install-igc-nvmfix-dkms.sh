@@ -37,7 +37,7 @@
 set -euo pipefail
 
 PKG="igc-nvmfix"
-PKGVER="2.3"
+PKGVER="2.4"
 SRCDIR="/usr/src/${PKG}-${PKGVER}"
 KVER="$(uname -r)"
 
@@ -135,6 +135,34 @@ if command -v dkms >/dev/null 2>&1; then
         log "Removing existing ${PKG}/${v} from DKMS..."
         dkms remove -m "$PKG" -v "$v" --all >/dev/null 2>&1 || true
         rm -rf "/usr/src/${PKG}-${v}"
+    done
+fi
+
+# Also remove OTHER DKMS packages that build an "igc" module (earlier
+# attempts such as igc-patched/1.0). They conflict with this one, and if their
+# build fails on a new kernel they break apt the same way.
+for conf in /usr/src/*/dkms.conf; do
+    [[ -f "$conf" ]] || continue
+    grep -qE '^[[:space:]]*BUILT_MODULE_NAME(\[0\])?=["'\'']?igc["'\'']?[[:space:]]*$' "$conf" || continue
+    name="$(grep -oP '^\s*PACKAGE_NAME=["'\'']?\K[^"'\''[:space:]]+' "$conf" | head -1)"
+    ver="$(grep -oP '^\s*PACKAGE_VERSION=["'\'']?\K[^"'\''[:space:]]+' "$conf" | head -1)"
+    [[ -n "$name" && -n "$ver" && "$name" != "$PKG" ]] || continue
+    warn "Removing conflicting DKMS package ${name}/${ver} (also builds igc): $(dirname "$conf")"
+    command -v dkms >/dev/null 2>&1 && dkms remove -m "$name" -v "$ver" --all >/dev/null 2>&1 || true
+    rm -rf "/var/lib/dkms/${name}"
+    rm -rf "$(dirname "$conf")"
+done
+# Leftover registrations whose /usr/src dir is already gone
+if command -v dkms >/dev/null 2>&1; then
+    for d in /var/lib/dkms/*/; do
+        name="$(basename "$d")"; [[ "$name" == "$PKG" ]] && continue
+        if find "$d" -name 'igc.ko*' -print -quit 2>/dev/null | grep -q .; then
+            warn "Removing stale DKMS registration ${name} (built igc.ko)"
+            for v in $(ls "$d" 2>/dev/null | grep -E '^[0-9]'); do
+                dkms remove -m "$name" -v "$v" --all >/dev/null 2>&1 || true
+            done
+            rm -rf "$d"
+        fi
     done
 fi
 log "Finishing any interrupted package configuration (dpkg --configure -a)..."
