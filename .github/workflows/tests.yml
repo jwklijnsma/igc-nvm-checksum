@@ -1,0 +1,25 @@
+name: tests
+
+# Tests the helper scripts the installer generates (NVM patcher, source lookup,
+# stock-driver fallback) against the vendored igc sources. No DKMS, no kernel
+# build, no network: fixed paths are pointed at temp dirs and git is stubbed.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get install -y -q zstd xz-utils
+      - run: pip install pytest
+      - run: python -m pytest -q tests

@@ -174,3 +174,17 @@ dmesg | grep -i igc
 ```
 
 If the build fails with `NVM checksum block not found`, upstream changed the code around the check and `igc-patch.py` (embedded in the installer) needs updating. Please open an issue with your `uname -r`.
+
+## Tests
+
+```bash
+pip install pytest && python -m pytest tests
+```
+
+The tests take the helper scripts the installer writes (`igc-patch.py`,
+`igc-fetch-patch.sh`, `igc-prepare.sh`, `igc-build.sh`) straight out of
+`install-igc-nvmfix-dkms.sh` and run them against the vendored sources in
+`vendor/igc/`: the NVM bypass must apply to every vendored kernel, the xsk
+compat fix only where needed, source lookup must prefer override → cache →
+vendor → download → nearest same-series source, and a failed build must fall
+back to the stock driver. Nothing is installed and no network is used.
